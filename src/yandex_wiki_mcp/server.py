@@ -1,5 +1,6 @@
 """MCP server for reading Yandex Wiki pages via the Yandex Wiki REST API."""
 
+import os
 import threading
 import time
 from urllib.parse import urlparse
@@ -12,11 +13,43 @@ from mcp.server import Server
 YANDEX_WIKI_API_BASE = "https://api.wiki.yandex.net"
 TOKEN_TTL_SECONDS = 2 * 60 * 60  # 2 hours
 
+# Link shown to users when they need to obtain a new OAuth token.
+YANDEX_OAUTH_URL = "https://oauth.yandex.ru"
+YANDEX_WIKI_API_DOCS_URL = "https://yandex.ru/support/wiki/api-ref/access.html"
+
 server = Server("yandex-wiki")
 
 # In-memory token store: email -> (oauth_token, expiry_timestamp)
 _token_store: dict[str, tuple[str, float]] = {}
 _token_store_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Environment helpers
+# ---------------------------------------------------------------------------
+
+def _get_user_email() -> str:
+    """Return the current user's email from the environment, raising if absent."""
+    email = os.getenv("YANDEX_WIKI_USER_EMAIL", "").strip().lower()
+    if not email:
+        raise ValueError(
+            "YANDEX_WIKI_USER_EMAIL environment variable is not set. "
+            "Please set it to your Yandex account email before starting the server: "
+            "export YANDEX_WIKI_USER_EMAIL=user@yandex.ru"
+        )
+    return email
+
+
+def _token_required_message(email: str) -> str:
+    """Return a human-readable message explaining how to obtain and register a token."""
+    return (
+        f"No valid OAuth token found for {email!r}.\n"
+        "To fix this, obtain a Yandex OAuth token and register it:\n"
+        f"  1. Open {YANDEX_OAUTH_URL} and create an application with wiki:read permission.\n"
+        "  2. Copy your token.\n"
+        "  3. Call: register_token(oauth_token=\"<your_token>\")\n"
+        f"Documentation: {YANDEX_WIKI_API_DOCS_URL}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -35,23 +68,17 @@ def store_token(email: str, oauth_token: str) -> None:
         _token_store[email] = (oauth_token, time.monotonic() + TOKEN_TTL_SECONDS)
 
 
-def get_token_for_user(email: str) -> str:
-    """Return the stored OAuth token for *email*, raising if absent or expired."""
+def get_token_for_user(email: str) -> str | None:
+    """Return the stored OAuth token for *email*, or None if absent/expired."""
     email = email.strip().lower()
     with _token_store_lock:
         entry = _token_store.get(email)
         if entry is None:
-            raise ValueError(
-                f"No OAuth token registered for {email!r}. "
-                "Call register_token(email, oauth_token) first."
-            )
+            return None
         token, expiry = entry
         if time.monotonic() > expiry:
             del _token_store[email]
-            raise ValueError(
-                f"OAuth token for {email!r} has expired (TTL is 2 hours). "
-                "Call register_token(email, oauth_token) again."
-            )
+            return None
     return token
 
 
@@ -112,26 +139,23 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="register_token",
             description=(
-                "Register a Yandex OAuth token for a user identified by their email. "
+                "Register your Yandex OAuth token so read_page can access the Wiki on your behalf. "
                 "The token is stored in memory for 2 hours. "
-                "Must be called before read_page."
+                "Your email is read automatically from the YANDEX_WIKI_USER_EMAIL environment variable. "
+                "Call this tool once before using read_page, or whenever read_page reports that the token is missing or expired."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "email": {
-                        "type": "string",
-                        "description": "Yandex account email address of the user.",
-                    },
                     "oauth_token": {
                         "type": "string",
                         "description": (
-                            "Yandex OAuth token with wiki:read permission. "
-                            "Obtain it at https://oauth.yandex.ru"
+                            "Your Yandex OAuth token with wiki:read permission. "
+                            f"Obtain it at {YANDEX_OAUTH_URL}"
                         ),
                     },
                 },
-                "required": ["email", "oauth_token"],
+                "required": ["oauth_token"],
             },
         ),
         types.Tool(
@@ -139,8 +163,8 @@ async def list_tools() -> list[types.Tool]:
             description=(
                 "Read the content of a Yandex Wiki page by its URL. "
                 "Returns the page body in wiki markup (source format). "
-                "Requires the user's OAuth token to have been registered "
-                "via register_token first."
+                "Your email is read from the YANDEX_WIKI_USER_EMAIL environment variable. "
+                "If no valid token is found, returns instructions on how to register one."
             ),
             inputSchema={
                 "type": "object",
@@ -152,15 +176,8 @@ async def list_tools() -> list[types.Tool]:
                             "https://wiki.yandex.ru/org/team/page"
                         ),
                     },
-                    "email": {
-                        "type": "string",
-                        "description": (
-                            "Yandex account email address of the user whose "
-                            "token should be used to fetch the page."
-                        ),
-                    },
                 },
-                "required": ["url", "email"],
+                "required": ["url"],
             },
         ),
     ]
@@ -171,14 +188,16 @@ async def call_tool(
     name: str, arguments: dict
 ) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
     if name == "register_token":
-        email = arguments.get("email", "")
+        email = _get_user_email()
         oauth_token = arguments.get("oauth_token", "")
         store_token(email, oauth_token)
-        display_email = email.strip().lower()
         return [
             types.TextContent(
                 type="text",
-                text=f"OAuth token for {display_email!r} registered successfully. It will expire in 2 hours.",
+                text=(
+                    f"OAuth token for {email!r} registered successfully. "
+                    "It will expire in 2 hours."
+                ),
             )
         ]
 
@@ -187,11 +206,13 @@ async def call_tool(
         if not url:
             raise ValueError("'url' argument is required and must not be empty")
 
-        email = arguments.get("email", "").strip()
-        if not email:
-            raise ValueError("'email' argument is required and must not be empty")
+        email = _get_user_email()
 
+        # Check token before making any HTTP call
         token = get_token_for_user(email)
+        if token is None:
+            return [types.TextContent(type="text", text=_token_required_message(email))]
+
         slug = _extract_slug(url)
 
         async with httpx.AsyncClient(timeout=30) as client:
@@ -201,6 +222,8 @@ async def call_tool(
                 headers=_auth_headers(token),
                 params={"slug": slug},
             )
+            if meta_response.status_code in (401, 403):
+                return [types.TextContent(type="text", text=_token_required_message(email))]
             meta_response.raise_for_status()
             meta = meta_response.json()
 
@@ -216,6 +239,8 @@ async def call_tool(
                     f"{YANDEX_WIKI_API_BASE}/v1/pages/{page_id}/body",
                     headers=_auth_headers(token),
                 )
+                if body_response.status_code in (401, 403):
+                    return [types.TextContent(type="text", text=_token_required_message(email))]
                 body_response.raise_for_status()
                 body_data = body_response.json()
                 content = body_data.get("body", body_data.get("source", ""))

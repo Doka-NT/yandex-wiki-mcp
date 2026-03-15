@@ -17,7 +17,7 @@ from yandex_wiki_mcp.server import (
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers / fixtures
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
@@ -28,6 +28,12 @@ def clear_token_store():
     yield
     with server_module._token_store_lock:
         server_module._token_store.clear()
+
+
+@pytest.fixture(autouse=True)
+def set_user_email(monkeypatch):
+    """Set the required YANDEX_WIKI_USER_EMAIL env var for every test."""
+    monkeypatch.setenv("YANDEX_WIKI_USER_EMAIL", FAKE_EMAIL)
 
 
 FAKE_EMAIL = "user@example.com"
@@ -80,9 +86,8 @@ class TestTokenStore:
         store_token("User@Example.COM", FAKE_TOKEN)
         assert get_token_for_user("user@example.com") == FAKE_TOKEN
 
-    def test_raises_when_no_token(self):
-        with pytest.raises(ValueError, match="No OAuth token registered"):
-            get_token_for_user(FAKE_EMAIL)
+    def test_returns_none_when_no_token(self):
+        assert get_token_for_user(FAKE_EMAIL) is None
 
     def test_raises_on_empty_email(self):
         with pytest.raises(ValueError, match="'email'"):
@@ -92,15 +97,16 @@ class TestTokenStore:
         with pytest.raises(ValueError, match="'oauth_token'"):
             store_token(FAKE_EMAIL, "")
 
-    def test_raises_when_token_expired(self, monkeypatch):
+    def test_returns_none_when_token_expired(self, monkeypatch):
         store_token(FAKE_EMAIL, FAKE_TOKEN)
         # Wind clock past TTL by one second
         original_monotonic = time.monotonic
         monkeypatch.setattr(
-            server_module.time, "monotonic", lambda: original_monotonic() + server_module.TOKEN_TTL_SECONDS + 1
+            server_module.time,
+            "monotonic",
+            lambda: original_monotonic() + server_module.TOKEN_TTL_SECONDS + 1,
         )
-        with pytest.raises(ValueError, match="expired"):
-            get_token_for_user(FAKE_EMAIL)
+        assert get_token_for_user(FAKE_EMAIL) is None
 
     def test_overwrite_token(self):
         store_token(FAKE_EMAIL, "old_token")
@@ -112,6 +118,21 @@ class TestTokenStore:
         store_token("bob@example.com", "token_bob")
         assert get_token_for_user("alice@example.com") == "token_alice"
         assert get_token_for_user("bob@example.com") == "token_bob"
+
+
+# ---------------------------------------------------------------------------
+# _get_user_email
+# ---------------------------------------------------------------------------
+
+def test_get_user_email_raises_when_env_absent(monkeypatch):
+    monkeypatch.delenv("YANDEX_WIKI_USER_EMAIL", raising=False)
+    with pytest.raises(ValueError, match="YANDEX_WIKI_USER_EMAIL"):
+        server_module._get_user_email()
+
+
+def test_get_user_email_normalises_to_lowercase(monkeypatch):
+    monkeypatch.setenv("YANDEX_WIKI_USER_EMAIL", "User@Example.COM")
+    assert server_module._get_user_email() == "user@example.com"
 
 
 # ---------------------------------------------------------------------------
@@ -129,9 +150,10 @@ async def test_list_tools_returns_both_tools():
 async def test_list_tools_register_token_schema():
     tools = await list_tools()
     tool = next(t for t in tools if t.name == "register_token")
-    assert "email" in tool.inputSchema["properties"]
     assert "oauth_token" in tool.inputSchema["properties"]
-    assert set(tool.inputSchema["required"]) == {"email", "oauth_token"}
+    # email is NOT an argument — it comes from the env var
+    assert "email" not in tool.inputSchema["properties"]
+    assert tool.inputSchema["required"] == ["oauth_token"]
 
 
 @pytest.mark.asyncio
@@ -139,8 +161,9 @@ async def test_list_tools_read_page_schema():
     tools = await list_tools()
     tool = next(t for t in tools if t.name == "read_page")
     assert "url" in tool.inputSchema["properties"]
-    assert "email" in tool.inputSchema["properties"]
-    assert set(tool.inputSchema["required"]) == {"url", "email"}
+    # email is NOT an argument — it comes from the env var
+    assert "email" not in tool.inputSchema["properties"]
+    assert tool.inputSchema["required"] == ["url"]
 
 
 # ---------------------------------------------------------------------------
@@ -149,22 +172,30 @@ async def test_list_tools_read_page_schema():
 
 @pytest.mark.asyncio
 async def test_register_token_stores_token():
-    result = await call_tool("register_token", {"email": FAKE_EMAIL, "oauth_token": FAKE_TOKEN})
+    result = await call_tool("register_token", {"oauth_token": FAKE_TOKEN})
     assert len(result) == 1
     assert "registered successfully" in result[0].text
     assert get_token_for_user(FAKE_EMAIL) == FAKE_TOKEN
 
 
 @pytest.mark.asyncio
-async def test_register_token_raises_on_empty_email():
-    with pytest.raises(ValueError, match="'email'"):
-        await call_tool("register_token", {"email": "", "oauth_token": FAKE_TOKEN})
+async def test_register_token_uses_email_from_env(monkeypatch):
+    monkeypatch.setenv("YANDEX_WIKI_USER_EMAIL", "other@example.com")
+    await call_tool("register_token", {"oauth_token": FAKE_TOKEN})
+    assert get_token_for_user("other@example.com") == FAKE_TOKEN
+
+
+@pytest.mark.asyncio
+async def test_register_token_raises_when_email_env_absent(monkeypatch):
+    monkeypatch.delenv("YANDEX_WIKI_USER_EMAIL", raising=False)
+    with pytest.raises(ValueError, match="YANDEX_WIKI_USER_EMAIL"):
+        await call_tool("register_token", {"oauth_token": FAKE_TOKEN})
 
 
 @pytest.mark.asyncio
 async def test_register_token_raises_on_empty_token():
     with pytest.raises(ValueError, match="'oauth_token'"):
-        await call_tool("register_token", {"email": FAKE_EMAIL, "oauth_token": ""})
+        await call_tool("register_token", {"oauth_token": ""})
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +218,7 @@ async def test_read_page_returns_body(registered_user):
         return_value=httpx.Response(200, json={"body": FAKE_BODY})
     )
 
-    result = await call_tool("read_page", {"url": FAKE_URL, "email": FAKE_EMAIL})
+    result = await call_tool("read_page", {"url": FAKE_URL})
 
     assert len(result) == 1
     assert result[0].type == "text"
@@ -204,7 +235,7 @@ async def test_read_page_fallback_to_source_field(registered_user):
         return_value=httpx.Response(200, json={"source": FAKE_BODY})
     )
 
-    result = await call_tool("read_page", {"url": FAKE_URL, "email": FAKE_EMAIL})
+    result = await call_tool("read_page", {"url": FAKE_URL})
 
     assert result[0].text == FAKE_BODY
 
@@ -220,7 +251,7 @@ async def test_read_page_list_response(registered_user):
         return_value=httpx.Response(200, json={"body": FAKE_BODY})
     )
 
-    result = await call_tool("read_page", {"url": FAKE_URL, "email": FAKE_EMAIL})
+    result = await call_tool("read_page", {"url": FAKE_URL})
 
     assert result[0].text == FAKE_BODY
 
@@ -233,7 +264,7 @@ async def test_read_page_no_id_fallback(registered_user):
         return_value=httpx.Response(200, json={"body": FAKE_BODY})
     )
 
-    result = await call_tool("read_page", {"url": FAKE_URL, "email": FAKE_EMAIL})
+    result = await call_tool("read_page", {"url": FAKE_URL})
 
     assert result[0].text == FAKE_BODY
 
@@ -241,42 +272,88 @@ async def test_read_page_no_id_fallback(registered_user):
 @pytest.mark.asyncio
 async def test_read_page_raises_on_missing_url(registered_user):
     with pytest.raises(ValueError, match="'url' argument"):
-        await call_tool("read_page", {"email": FAKE_EMAIL})
+        await call_tool("read_page", {})
 
 
 @pytest.mark.asyncio
-async def test_read_page_raises_on_missing_email():
-    with pytest.raises(ValueError, match="'email' argument"):
+async def test_read_page_raises_when_email_env_absent(monkeypatch, registered_user):
+    monkeypatch.delenv("YANDEX_WIKI_USER_EMAIL", raising=False)
+    with pytest.raises(ValueError, match="YANDEX_WIKI_USER_EMAIL"):
         await call_tool("read_page", {"url": FAKE_URL})
 
 
 @pytest.mark.asyncio
-async def test_read_page_raises_when_token_not_registered():
-    with pytest.raises(ValueError, match="No OAuth token registered"):
-        await call_tool("read_page", {"url": FAKE_URL, "email": "unknown@example.com"})
+async def test_read_page_returns_token_instructions_when_no_token_stored():
+    """When no token is registered, read_page returns help text instead of raising."""
+    result = await call_tool("read_page", {"url": FAKE_URL})
+    assert len(result) == 1
+    assert "register_token" in result[0].text
+    assert server_module.YANDEX_OAUTH_URL in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_read_page_returns_token_instructions_when_token_expired(monkeypatch):
+    store_token(FAKE_EMAIL, FAKE_TOKEN)
+    original_monotonic = time.monotonic
+    monkeypatch.setattr(
+        server_module.time,
+        "monotonic",
+        lambda: original_monotonic() + server_module.TOKEN_TTL_SECONDS + 1,
+    )
+    result = await call_tool("read_page", {"url": FAKE_URL})
+    assert "register_token" in result[0].text
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_read_page_returns_token_instructions_on_401(registered_user):
+    """HTTP 401 from the API returns token instructions instead of raising."""
+    respx.get("https://api.wiki.yandex.net/v1/pages").mock(
+        return_value=httpx.Response(401, json={"error": "Unauthorized"})
+    )
+
+    result = await call_tool("read_page", {"url": FAKE_URL})
+
+    assert "register_token" in result[0].text
+    assert server_module.YANDEX_OAUTH_URL in result[0].text
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_read_page_returns_token_instructions_on_403(registered_user):
+    """HTTP 403 from the API returns token instructions instead of raising."""
+    respx.get("https://api.wiki.yandex.net/v1/pages").mock(
+        return_value=httpx.Response(403, json={"error": "Forbidden"})
+    )
+
+    result = await call_tool("read_page", {"url": FAKE_URL})
+
+    assert "register_token" in result[0].text
+    assert server_module.YANDEX_OAUTH_URL in result[0].text
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_read_page_http_error_propagates_on_non_auth_errors(registered_user):
+    """Non-auth HTTP errors (e.g. 500) still propagate as exceptions."""
+    respx.get("https://api.wiki.yandex.net/v1/pages").mock(
+        return_value=httpx.Response(500, json={"error": "Internal Server Error"})
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await call_tool("read_page", {"url": FAKE_URL})
 
 
 @pytest.mark.asyncio
 async def test_call_tool_raises_on_unknown_tool():
     with pytest.raises(ValueError, match="Unknown tool"):
-        await call_tool("unknown_tool", {"url": FAKE_URL, "email": FAKE_EMAIL})
+        await call_tool("unknown_tool", {"url": FAKE_URL})
 
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_read_page_http_error_propagates(registered_user):
-    respx.get("https://api.wiki.yandex.net/v1/pages").mock(
-        return_value=httpx.Response(401, json={"error": "Unauthorized"})
-    )
-
-    with pytest.raises(httpx.HTTPStatusError):
-        await call_tool("read_page", {"url": FAKE_URL, "email": FAKE_EMAIL})
-
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_two_users_use_own_tokens():
-    """Two users registered simultaneously each read with their own token."""
+async def test_different_users_read_with_own_tokens(monkeypatch):
+    """Each user email maps to its own token in the store; sequential reads use the right token."""
     store_token("alice@example.com", "token_alice")
     store_token("bob@example.com", "token_bob")
 
@@ -299,9 +376,13 @@ async def test_two_users_use_own_tokens():
         side_effect=make_body_response
     )
 
-    alice_result = await call_tool("read_page", {"url": FAKE_URL, "email": "alice@example.com"})
-    bob_result = await call_tool("read_page", {"url": FAKE_URL, "email": "bob@example.com"})
+    monkeypatch.setenv("YANDEX_WIKI_USER_EMAIL", "alice@example.com")
+    alice_result = await call_tool("read_page", {"url": FAKE_URL})
+
+    monkeypatch.setenv("YANDEX_WIKI_USER_EMAIL", "bob@example.com")
+    bob_result = await call_tool("read_page", {"url": FAKE_URL})
 
     assert alice_result[0].text == "Alice's page"
     assert bob_result[0].text == "Bob's page"
+
 
