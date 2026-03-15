@@ -1,6 +1,7 @@
 """MCP server for reading Yandex Wiki pages via the Yandex Wiki REST API."""
 
-import os
+import threading
+import time
 from urllib.parse import urlparse
 
 import httpx
@@ -9,21 +10,54 @@ import mcp.types as types
 from mcp.server import Server
 
 YANDEX_WIKI_API_BASE = "https://api.wiki.yandex.net"
+TOKEN_TTL_SECONDS = 2 * 60 * 60  # 2 hours
 
 server = Server("yandex-wiki")
 
+# In-memory token store: email -> (oauth_token, expiry_timestamp)
+_token_store: dict[str, tuple[str, float]] = {}
+_token_store_lock = threading.Lock()
 
-def _get_oauth_token() -> str:
-    """Return the OAuth token from the environment, raising if absent."""
-    token = os.getenv("YANDEX_WIKI_OAUTH_TOKEN", "").strip()
-    if not token:
-        raise ValueError(
-            "YANDEX_WIKI_OAUTH_TOKEN environment variable is not set. "
-            "Please obtain a Yandex OAuth token and export it before starting "
-            "the server: export YANDEX_WIKI_OAUTH_TOKEN=<your_token>"
-        )
+
+# ---------------------------------------------------------------------------
+# Token store helpers
+# ---------------------------------------------------------------------------
+
+def store_token(email: str, oauth_token: str) -> None:
+    """Store *oauth_token* for *email* with a 2-hour TTL."""
+    email = email.strip().lower()
+    oauth_token = oauth_token.strip()
+    if not email:
+        raise ValueError("'email' must not be empty")
+    if not oauth_token:
+        raise ValueError("'oauth_token' must not be empty")
+    with _token_store_lock:
+        _token_store[email] = (oauth_token, time.monotonic() + TOKEN_TTL_SECONDS)
+
+
+def get_token_for_user(email: str) -> str:
+    """Return the stored OAuth token for *email*, raising if absent or expired."""
+    email = email.strip().lower()
+    with _token_store_lock:
+        entry = _token_store.get(email)
+        if entry is None:
+            raise ValueError(
+                f"No OAuth token registered for {email!r}. "
+                "Call register_token(email, oauth_token) first."
+            )
+        token, expiry = entry
+        if time.monotonic() > expiry:
+            del _token_store[email]
+            raise ValueError(
+                f"OAuth token for {email!r} has expired (TTL is 2 hours). "
+                "Call register_token(email, oauth_token) again."
+            )
     return token
 
+
+# ---------------------------------------------------------------------------
+# URL → slug
+# ---------------------------------------------------------------------------
 
 def _is_plain_slug(url: str) -> bool:
     """Return True when *url* looks like a bare wiki slug rather than a full URL.
@@ -68,15 +102,45 @@ def _auth_headers(token: str) -> dict[str, str]:
     }
 
 
+# ---------------------------------------------------------------------------
+# MCP tools
+# ---------------------------------------------------------------------------
+
 @server.list_tools()
 async def list_tools() -> list[types.Tool]:
     return [
+        types.Tool(
+            name="register_token",
+            description=(
+                "Register a Yandex OAuth token for a user identified by their email. "
+                "The token is stored in memory for 2 hours. "
+                "Must be called before read_page."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "email": {
+                        "type": "string",
+                        "description": "Yandex account email address of the user.",
+                    },
+                    "oauth_token": {
+                        "type": "string",
+                        "description": (
+                            "Yandex OAuth token with wiki:read permission. "
+                            "Obtain it at https://oauth.yandex.ru"
+                        ),
+                    },
+                },
+                "required": ["email", "oauth_token"],
+            },
+        ),
         types.Tool(
             name="read_page",
             description=(
                 "Read the content of a Yandex Wiki page by its URL. "
                 "Returns the page body in wiki markup (source format). "
-                "Requires YANDEX_WIKI_OAUTH_TOKEN to be set in the environment."
+                "Requires the user's OAuth token to have been registered "
+                "via register_token first."
             ),
             inputSchema={
                 "type": "object",
@@ -87,11 +151,18 @@ async def list_tools() -> list[types.Tool]:
                             "Full URL of the Yandex Wiki page, e.g. "
                             "https://wiki.yandex.ru/org/team/page"
                         ),
-                    }
+                    },
+                    "email": {
+                        "type": "string",
+                        "description": (
+                            "Yandex account email address of the user whose "
+                            "token should be used to fetch the page."
+                        ),
+                    },
                 },
-                "required": ["url"],
+                "required": ["url", "email"],
             },
-        )
+        ),
     ]
 
 
@@ -99,47 +170,67 @@ async def list_tools() -> list[types.Tool]:
 async def call_tool(
     name: str, arguments: dict
 ) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-    if name != "read_page":
-        raise ValueError(f"Unknown tool: {name!r}")
-
-    url = arguments.get("url", "").strip()
-    if not url:
-        raise ValueError("'url' argument is required and must not be empty")
-
-    token = _get_oauth_token()
-    slug = _extract_slug(url)
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        # Step 1: get page metadata to obtain the numeric page id
-        meta_response = await client.get(
-            f"{YANDEX_WIKI_API_BASE}/v1/pages",
-            headers=_auth_headers(token),
-            params={"slug": slug},
-        )
-        meta_response.raise_for_status()
-        meta = meta_response.json()
-
-        # Normalise: some API versions wrap results in a list
-        if isinstance(meta, list):
-            meta = meta[0] if meta else {}
-
-        page_id = meta.get("id")
-
-        if page_id:
-            # Step 2: fetch the page body using its id
-            body_response = await client.get(
-                f"{YANDEX_WIKI_API_BASE}/v1/pages/{page_id}/body",
-                headers=_auth_headers(token),
+    if name == "register_token":
+        email = arguments.get("email", "")
+        oauth_token = arguments.get("oauth_token", "")
+        store_token(email, oauth_token)
+        display_email = email.strip().lower()
+        return [
+            types.TextContent(
+                type="text",
+                text=f"OAuth token for {display_email!r} registered successfully. It will expire in 2 hours.",
             )
-            body_response.raise_for_status()
-            body_data = body_response.json()
-            content = body_data.get("body", body_data.get("source", ""))
-        else:
-            # Fallback: return whatever the metadata endpoint returned
-            content = meta.get("body", meta.get("source", str(meta)))
+        ]
 
-    return [types.TextContent(type="text", text=str(content))]
+    if name == "read_page":
+        url = arguments.get("url", "").strip()
+        if not url:
+            raise ValueError("'url' argument is required and must not be empty")
 
+        email = arguments.get("email", "").strip()
+        if not email:
+            raise ValueError("'email' argument is required and must not be empty")
+
+        token = get_token_for_user(email)
+        slug = _extract_slug(url)
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Step 1: get page metadata to obtain the numeric page id
+            meta_response = await client.get(
+                f"{YANDEX_WIKI_API_BASE}/v1/pages",
+                headers=_auth_headers(token),
+                params={"slug": slug},
+            )
+            meta_response.raise_for_status()
+            meta = meta_response.json()
+
+            # Normalise: some API versions wrap results in a list
+            if isinstance(meta, list):
+                meta = meta[0] if meta else {}
+
+            page_id = meta.get("id")
+
+            if page_id:
+                # Step 2: fetch the page body using its id
+                body_response = await client.get(
+                    f"{YANDEX_WIKI_API_BASE}/v1/pages/{page_id}/body",
+                    headers=_auth_headers(token),
+                )
+                body_response.raise_for_status()
+                body_data = body_response.json()
+                content = body_data.get("body", body_data.get("source", ""))
+            else:
+                # Fallback: return whatever the metadata endpoint returned
+                content = meta.get("body", meta.get("source", str(meta)))
+
+        return [types.TextContent(type="text", text=str(content))]
+
+    raise ValueError(f"Unknown tool: {name!r}")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     """Entry point – run the MCP server over stdio."""
@@ -154,3 +245,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
